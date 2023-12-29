@@ -1,5 +1,6 @@
-use multivm::vm_latest::constants::{ERGS_PER_CIRCUIT, MAX_CYCLES_FOR_TX};
 use std::fmt;
+
+use multivm::vm_latest::constants::{ERGS_PER_CIRCUIT, MAX_CYCLES_FOR_TX};
 use zksync_config::configs::chain::StateKeeperConfig;
 use zksync_types::{
     circuit::{GEOMETRY_CONFIG, SCHEDULER_UPPER_BOUND},
@@ -148,7 +149,7 @@ impl MetricExtractor for L2ToL1LogsCriterion {
     }
 
     fn extract(metrics: &ExecutionMetrics, _writes: &DeduplicatedWritesMetrics) -> usize {
-        metrics.l2_l1_logs
+        metrics.l2_to_l1_logs
     }
 }
 
@@ -412,7 +413,7 @@ mod tests {
     fn l2_to_l1_logs_seal_criterion() {
         test_scenario_execution_metrics!(
             L2ToL1LogsCriterion,
-            l2_l1_logs,
+            l2_to_l1_logs,
             usize,
             ProtocolVersionId::Version17
         );

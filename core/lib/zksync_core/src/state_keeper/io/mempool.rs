@@ -1,6 +1,3 @@
-use anyhow::Context as _;
-use async_trait::async_trait;
-
 use std::{
     cmp,
     collections::HashMap,
@@ -8,13 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use multivm::interface::{FinishedL1Batch, L1BatchEnv, SystemEnv};
-use multivm::vm_latest::utils::fee::derive_base_fee_and_gas_per_pubdata;
-
+use async_trait::async_trait;
+use multivm::{
+    interface::{FinishedL1Batch, L1BatchEnv, SystemEnv},
+    vm_latest::utils::fee::derive_base_fee_and_gas_per_pubdata,
+};
 use zksync_config::configs::chain::StateKeeperConfig;
 use zksync_dal::ConnectionPool;
 use zksync_mempool::L2TxFilter;
-use zksync_object_store::ObjectStoreFactory;
+use zksync_object_store::ObjectStore;
 use zksync_types::{
     block::MiniblockHeader, protocol_version::ProtocolUpgradeTx,
     witness_block_state::WitnessBlockState, Address, L1BatchNumber, L2ChainId, MiniblockNumber,
@@ -47,6 +46,7 @@ use crate::{
 pub(crate) struct MempoolIO<G> {
     mempool: MempoolGuard,
     pool: ConnectionPool,
+    object_store: Box<dyn ObjectStore>,
     timeout_sealer: TimeoutSealer,
     filter: L2TxFilter,
     current_miniblock_number: MiniblockNumber,
@@ -274,6 +274,8 @@ where
             self.current_l1_batch_number,
             self.current_miniblock_number,
             self.l2_erc20_bridge_addr,
+            None,
+            false,
         );
         self.miniblock_sealer_handle.submit(command).await;
         self.current_miniblock_number += 1;
@@ -297,11 +299,8 @@ where
         self.miniblock_sealer_handle.wait_for_all_commands().await;
 
         if let Some(witness_witness_block_state) = witness_block_state {
-            let object_store = ObjectStoreFactory::from_env()
-                .context("ObjectsStoreFactor::from_env()")?
-                .create_store()
-                .await;
-            match object_store
+            match self
+                .object_store
                 .put(self.current_l1_batch_number(), &witness_witness_block_state)
                 .await
             {
@@ -326,6 +325,7 @@ where
                 l1_batch_env,
                 finished_batch,
                 self.l2_erc20_bridge_addr,
+                None,
             )
             .await;
         self.current_miniblock_number += 1; // Due to fictive miniblock being sealed.
@@ -405,6 +405,7 @@ impl<G: L1GasPriceProvider> MempoolIO<G> {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::state_keeper) async fn new(
         mempool: MempoolGuard,
+        object_store: Box<dyn ObjectStore>,
         miniblock_sealer_handle: MiniblockSealerHandle,
         l1_gas_price_provider: Arc<G>,
         pool: ConnectionPool,
@@ -439,6 +440,7 @@ impl<G: L1GasPriceProvider> MempoolIO<G> {
 
         Self {
             mempool,
+            object_store,
             pool,
             timeout_sealer: TimeoutSealer::new(config),
             filter: L2TxFilter::default(),
@@ -524,7 +526,6 @@ impl<G: L1GasPriceProvider> MempoolIO<G> {
 #[cfg(test)]
 mod tests {
     use tokio::time::timeout_at;
-
     use zksync_utils::time::seconds_since_epoch;
 
     use super::*;

@@ -1,27 +1,23 @@
 //! Helper module to submit transactions into the zkSync Network.
 
-// External uses
+use std::{cmp, num::NonZeroU32, sync::Arc, time::Instant};
+
 use governor::{
     clock::MonotonicClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-
-// Built-in uses
-use std::{cmp, num::NonZeroU32, sync::Arc, time::Instant};
-
-// Workspace uses
-
-use multivm::interface::VmExecutionResultAndLogs;
-use multivm::vm_latest::{
-    constants::{BLOCK_GAS_LIMIT, MAX_PUBDATA_PER_BLOCK},
-    utils::{
-        fee::derive_base_fee_and_gas_per_pubdata,
-        overhead::{derive_overhead, OverheadCoeficients},
+use multivm::{
+    interface::VmExecutionResultAndLogs,
+    vm_latest::{
+        constants::{BLOCK_GAS_LIMIT, MAX_PUBDATA_PER_BLOCK},
+        utils::{
+            fee::derive_base_fee_and_gas_per_pubdata,
+            overhead::{derive_overhead, OverheadCoefficients},
+        },
     },
 };
-
 use zksync_config::configs::{api::Web3JsonRpcConfig, chain::StateKeeperConfig};
 use zksync_contracts::BaseSystemContracts;
 use zksync_dal::{transactions_dal::L2TxSubmissionResult, ConnectionPool};
@@ -29,26 +25,24 @@ use zksync_state::PostgresStorageCaches;
 use zksync_types::{
     fee::{Fee, TransactionExecutionMetrics},
     get_code_key, get_intrinsic_constants,
-    l2::error::TxCheckError::TxDuplication,
-    l2::L2Tx,
+    l2::{error::TxCheckError::TxDuplication, L2Tx},
     utils::storage_key_for_eth_balance,
     AccountTreeId, Address, ExecuteTransactionCommon, L2ChainId, Nonce, PackedEthSignature,
     ProtocolVersionId, Transaction, H160, H256, MAX_GAS_PER_PUBDATA_BYTE, MAX_L2_TX_GAS_LIMIT,
     MAX_NEW_FACTORY_DEPS, U256,
 };
-
 use zksync_utils::h256_to_u256;
 
-// Local uses
-use crate::api_server::{
-    execution_sandbox::{
-        adjust_l1_gas_price_for_tx, execute_tx_eth_call, execute_tx_with_pending_state,
-        get_pubdata_for_factory_deps, BlockArgs, SubmitTxStage, TxExecutionArgs, TxSharedArgs,
-        VmConcurrencyLimiter, VmPermit, SANDBOX_METRICS,
-    },
-    tx_sender::result::ApiCallResult,
-};
+pub(super) use self::{proxy::TxProxy, result::SubmitTxError};
 use crate::{
+    api_server::{
+        execution_sandbox::{
+            adjust_l1_gas_price_for_tx, execute_tx_eth_call, execute_tx_with_pending_state,
+            get_pubdata_for_factory_deps, BlockArgs, SubmitTxStage, TxExecutionArgs, TxSharedArgs,
+            VmConcurrencyLimiter, VmPermit, SANDBOX_METRICS,
+        },
+        tx_sender::result::ApiCallResult,
+    },
     l1_gas_price::L1GasPriceProvider,
     metrics::{TxStage, APP_METRICS},
     state_keeper::seal_criteria::{ConditionalSealer, SealData},
@@ -56,8 +50,6 @@ use crate::{
 
 mod proxy;
 mod result;
-
-pub(super) use self::{proxy::TxProxy, result::SubmitTxError};
 
 /// Type alias for the rate limiter implementation.
 type TxSenderRateLimiter =
@@ -71,6 +63,8 @@ pub struct MultiVMBaseSystemContracts {
     pub(crate) post_virtual_blocks: BaseSystemContracts,
     /// Contracts to be used for protocol versions after virtual block upgrade fix.
     pub(crate) post_virtual_blocks_finish_upgrade_fix: BaseSystemContracts,
+    /// Contracts to be used for post-boojum protocol versions.
+    pub(crate) post_boojum: BaseSystemContracts,
 }
 
 impl MultiVMBaseSystemContracts {
@@ -93,8 +87,8 @@ impl MultiVMBaseSystemContracts {
             ProtocolVersionId::Version14
             | ProtocolVersionId::Version15
             | ProtocolVersionId::Version16
-            | ProtocolVersionId::Version17
-            | ProtocolVersionId::Version18 => self.post_virtual_blocks_finish_upgrade_fix,
+            | ProtocolVersionId::Version17 => self.post_virtual_blocks_finish_upgrade_fix,
+            ProtocolVersionId::Version18 | ProtocolVersionId::Version19 => self.post_boojum,
         }
     }
 }
@@ -109,7 +103,7 @@ pub struct ApiContracts {
     pub(crate) estimate_gas: MultiVMBaseSystemContracts,
     /// Contracts to be used when performing `eth_call` requests.
     /// These contracts (mainly, bootloader) normally should be tuned to provide better UX
-    /// exeprience (e.g. revert messages).
+    /// experience (e.g. revert messages).
     pub(crate) eth_call: MultiVMBaseSystemContracts,
 }
 
@@ -124,12 +118,14 @@ impl ApiContracts {
                 post_virtual_blocks: BaseSystemContracts::estimate_gas_post_virtual_blocks(),
                 post_virtual_blocks_finish_upgrade_fix:
                     BaseSystemContracts::estimate_gas_post_virtual_blocks_finish_upgrade_fix(),
+                post_boojum: BaseSystemContracts::estimate_gas_post_boojum(),
             },
             eth_call: MultiVMBaseSystemContracts {
                 pre_virtual_blocks: BaseSystemContracts::playground_pre_virtual_blocks(),
                 post_virtual_blocks: BaseSystemContracts::playground_post_virtual_blocks(),
                 post_virtual_blocks_finish_upgrade_fix:
                     BaseSystemContracts::playground_post_virtual_blocks_finish_upgrade_fix(),
+                post_boojum: BaseSystemContracts::playground_post_boojum(),
             },
         }
     }
@@ -231,8 +227,6 @@ pub struct TxSenderConfig {
     pub fair_l2_gas_price: u64,
     pub vm_execution_cache_misses_limit: Option<usize>,
     pub validation_computational_gas_limit: u32,
-    pub default_aa: H256,
-    pub bootloader: H256,
     pub chain_id: L2ChainId,
 }
 
@@ -251,8 +245,6 @@ impl TxSenderConfig {
             vm_execution_cache_misses_limit: web3_json_config.vm_execution_cache_misses_limit,
             validation_computational_gas_limit: state_keeper_config
                 .validation_computational_gas_limit,
-            default_aa: state_keeper_config.default_aa_hash,
-            bootloader: state_keeper_config.bootloader_hash,
             chain_id,
         }
     }
@@ -600,7 +592,7 @@ impl<G: L1GasPriceProvider> TxSender<G> {
                 tx_gas_limit,
                 gas_per_pubdata_byte as u32,
                 tx.encoding_len(),
-                OverheadCoeficients::from_tx_type(tx.tx_format() as u8),
+                OverheadCoefficients::from_tx_type(tx.tx_format() as u8),
             );
 
         match &mut tx.common_data {
@@ -832,7 +824,7 @@ impl<G: L1GasPriceProvider> TxSender<G> {
             suggested_gas_limit,
             gas_per_pubdata_byte as u32,
             tx.encoding_len(),
-            OverheadCoeficients::from_tx_type(tx.tx_format() as u8),
+            OverheadCoefficients::from_tx_type(tx.tx_format() as u8),
         );
 
         let full_gas_limit =
@@ -907,11 +899,11 @@ impl<G: L1GasPriceProvider> TxSender<G> {
             H256::zero()
         };
 
-        let seal_data = SealData::for_transaction(transaction, tx_metrics);
         // Using `ProtocolVersionId::latest()` for a short period we might end up in a scenario where the StateKeeper is still pre-boojum
         // but the API assumes we are post boojum. In this situation we will determine a tx as being executable but the StateKeeper will
         // still reject them as it's not.
         let protocol_version = ProtocolVersionId::latest();
+        let seal_data = SealData::for_transaction(transaction, tx_metrics, protocol_version);
         if let Some(reason) =
             ConditionalSealer::find_unexecutable_reason(sk_config, &seal_data, protocol_version)
         {
